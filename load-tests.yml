@@ -1,0 +1,22 @@
+---
+execution:
+  - concurrency: 10
+    ramp-up: 1s
+    hold-for: 60s
+    scenario: simple
+
+scenarios:
+  simple:
+    timeout: 500ms
+    keepalive: true
+    requests:
+      - http://webapi:8000/api/test
+
+reporting:
+  - module: console
+  - module: final-stats
+    summary: true
+    percentiles: true
+    failed-labels: false
+    test-duration: true
+    dump-csv: taurus-load-tests-report.csv

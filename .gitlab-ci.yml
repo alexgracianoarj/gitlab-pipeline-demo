@@ -1,0 +1,220 @@
+cache:
+  key: $CI_COMMIT_REF_SLUG
+  paths:
+    - .m2/repository/
+
+variables:
+  MAVEN_OPTS: -Dmaven.repo.local=.m2/repository
+
+stages:
+  - build
+  - unit-tests
+  - test
+  - sast-scan
+  - build-docker-image
+  - container-scan
+  - taurus-load-tests
+  - dast-scan
+  - send-mail
+
+include:
+  - template: Security/SAST.gitlab-ci.yml
+
+build:
+  stage: build
+  image: maven:3-openjdk-8
+  tags:
+    - gitlab-org
+  script: |
+    mvn clean package -DskipTests
+  artifacts:
+    paths:
+      - target/
+
+unit-tests:
+  variables:
+    TEST_TYPE: junit
+  stage: unit-tests
+  image: maven:3-openjdk-8
+  tags:
+    - gitlab-org
+  script:
+    - mvn test
+
+spotbugs-sast:
+  dependencies:
+    - build
+  variables:
+    MAVEN_REPO_PATH: ./.m2/repository
+    COMPILE: "false"
+  stage: sast-scan
+  tags:
+    - gitlab-org
+  script:
+    - /analyzer run
+  allow_failure: true
+  artifacts:
+    paths:
+      - gl-sast-report.json
+
+owasp-dependency-check:
+  image:
+    name: owasp/dependency-check:latest
+    entrypoint: [""]
+  stage: sast-scan
+  tags:
+    - gitlab-org
+  script:
+    - /usr/share/dependency-check/bin/dependency-check.sh --scan "./" --format "HTML" --project "$CI_PROJECT_NAME" --suppression "./owasp-depscan-suppress.xml" --out "./dependency-check-report.html" || true
+  allow_failure: true
+  artifacts:
+    paths:
+      - dependency-check-report.html
+
+build-docker-image:
+  variables:
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_CERTDIR: /certs
+    DOCKER_TLS_VERIFY: 1
+    DOCKER_CERT_PATH: $DOCKER_TLS_CERTDIR/client
+  services:
+    - name: docker:19.03.12-dind
+  image: docker:19.03.12
+  tags:
+    - gitlab-org-docker
+  stage: build-docker-image
+  script:
+    - docker build -t $CI_REGISTRY_IMAGE:latest .
+    - docker login -u gitlab-ci-token -p $CI_JOB_TOKEN $CI_REGISTRY
+    - docker push $CI_REGISTRY_IMAGE:latest
+
+trivy-container-scan:
+  image: docker:19.03.12
+  tags:
+    - gitlab-org-docker
+  stage: container-scan
+  variables:
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_CERTDIR: /certs
+    DOCKER_TLS_VERIFY: 1
+    DOCKER_CERT_PATH: $DOCKER_TLS_CERTDIR/client
+    IMAGE: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+    TRIVY_DEBUG: "true"
+  services:
+    - name: docker:19.03.12-dind
+  before_script:
+    - export TRIVY_VERSION=$(wget -qO - "https://api.github.com/repos/aquasecurity/trivy/releases/latest" | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
+    - wget --no-verbose https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz -O - | tar -zxvf -
+  allow_failure: true
+  script:
+    - docker build -t $IMAGE .
+    - ./trivy image --severity HIGH,CRITICAL --format template --template "@contrib/html.tpl" --output trivy-container-scan-report.html $IMAGE
+  cache:
+    paths:
+      - .trivycache/
+  artifacts:
+    paths:
+      - trivy-container-scan-report.html
+
+taurus-load-tests:
+  services:
+    - name: $CI_REGISTRY_IMAGE:latest
+      alias: webapi
+  image:
+    name: blazemeter/taurus:latest
+    entrypoint: [""]
+  tags:
+    - gitlab-org
+  stage: taurus-load-tests
+  script:
+    - bzt load-tests.yml
+  artifacts:
+    paths:
+      - taurus-load-tests-report.csv
+
+owasp-zap-scan:
+  services:
+    - name: $CI_REGISTRY_IMAGE:latest
+      alias: webapi
+  image: owasp/zap2docker-stable:latest
+  tags:
+    - gitlab-org
+  stage: dast-scan
+  script:
+    - mkdir /zap/wrk/
+    - /zap/zap-api-scan.py -t http://webapi:8000/v3/api-docs -f openapi -r owasp-zap-scan-report.html || true
+    - cp /zap/wrk/owasp-zap-scan-report.html .
+  artifacts:
+    paths:
+      - owasp-zap-scan-report.html
+
+nikto-scan:
+  services:
+    - name: $CI_REGISTRY_IMAGE:latest
+      alias: webapi
+  image:
+    name: perl:latest
+  tags:
+    - gitlab-org
+  stage: dast-scan
+  script:
+    - git clone https://github.com/sullo/nikto
+    - perl ./nikto/program/nikto.pl -h http://webapi:8000 -o /tmp/nikto-scan-report.html || true
+    - cp /tmp/nikto-scan-report.html .
+  artifacts:
+    paths:
+      - nikto-scan-report.html
+
+send-mail-reports:
+  dependencies:
+    - spotbugs-sast
+    - taurus-load-tests
+    - owasp-zap-scan
+    - nikto-scan
+    - trivy-container-scan
+    - owasp-dependency-check
+  variables:
+    REPORT_FILES: gl-sast-report.json,taurus-load-tests-report.csv,owasp-zap-scan-report.html,nikto-scan-report.html,dependency-check-report.html,gl-container-scanning-report.json,trivy-container-scan-report.html
+  image: python:3.8-alpine
+  tags:
+    - gitlab-org
+  stage: send-mail
+  script:
+    - |
+      cat << EOF > send_mail.py
+      import os
+      import smtplib
+      import email.utils
+      from email.mime.multipart import MIMEMultipart
+      from email.mime.application import MIMEApplication
+      from email.mime.text import MIMEText
+
+      msg = MIMEMultipart("alternative")
+      msg["Subject"] = f"Send Mail Reports - Project '{os.getenv('CI_PROJECT_TITLE')}'"
+      msg["From"] = email.utils.formataddr(("Send Mail Reports", os.getenv("SENDER")))
+      msg["To"] = os.getenv("RECIPIENT")
+      msg.attach(MIMEText("Send Mail Reports"))
+      for filename in os.getenv("REPORT_FILES").split(","):
+        try:
+          with open(filename, "rb") as file:
+              part = MIMEApplication(file.read(), Name=filename)
+          part["Content-Disposition"] = f"attachment; filename={filename}"
+          msg.attach(part)
+        except Exception as error:
+            print("Error on try read file: ", error)
+      try:
+          server = smtplib.SMTP(os.getenv("SMTP_HOST"), os.getenv("SMTP_PORT"))
+          server.ehlo()
+          server.starttls()
+          server.ehlo()
+          server.login(os.getenv("SMTP_USER"), os.getenv("SMTP_PASSWORD"))
+          for recipient in os.getenv("RECIPIENT").split(","):
+            server.sendmail(os.getenv("SENDER"), recipient, msg.as_string())
+          server.close()
+      except Exception as error:
+          print("Error on try send email: ", error)
+          exit(1)
+      else:
+          print("Email sent!")
+      EOF
+    - python send_mail.py

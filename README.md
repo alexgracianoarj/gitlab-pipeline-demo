@@ -1,3 +1,2 @@
 # GitLab pipeline demo
-
-A GitLab pipeline demo with DevSecOps best practices using open source tools.
+A GitLab pipeline demo with DevSecOps best practices (SAST, DAST and Container scan) using open source tools. See pipeline result on [GitLab](https://gitlab.com/alexgracianoarj/gitlab-pipeline-demo/-/pipelines) (:sweat_smile:)
