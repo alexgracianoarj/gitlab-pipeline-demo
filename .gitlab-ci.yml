@@ -24,7 +24,7 @@ build:
   stage: build
   image: maven:3-openjdk-8
   tags:
-    - gitlab-org
+    - docker
   script: |
     mvn clean package -DskipTests
   artifacts:
@@ -37,7 +37,7 @@ unit-tests:
   stage: unit-tests
   image: maven:3-openjdk-8
   tags:
-    - gitlab-org
+    - docker
   script:
     - mvn test
 
@@ -49,7 +49,7 @@ spotbugs-sast:
     COMPILE: "false"
   stage: sast-scan
   tags:
-    - gitlab-org
+    - docker
   script:
     - /analyzer run
   allow_failure: true
@@ -63,7 +63,7 @@ owasp-dependency-check:
     entrypoint: [""]
   stage: sast-scan
   tags:
-    - gitlab-org
+    - docker
   script:
     - /usr/share/dependency-check/bin/dependency-check.sh --scan "./" --format "HTML" --project "$CI_PROJECT_NAME" --suppression "./owasp-depscan-suppress.xml" --out "./dependency-check-report.html" || true
   allow_failure: true
@@ -81,7 +81,7 @@ build-docker-image:
     - name: docker:19.03.12-dind
   image: docker:19.03.12
   tags:
-    - gitlab-org-docker
+    - docker-dind
   stage: build-docker-image
   script:
     - docker build -t $CI_REGISTRY_IMAGE:latest .
@@ -91,7 +91,7 @@ build-docker-image:
 trivy-container-scan:
   image: docker:19.03.12
   tags:
-    - gitlab-org-docker
+    - docker-dind
   stage: container-scan
   variables:
     DOCKER_HOST: tcp://docker:2376
@@ -124,7 +124,7 @@ taurus-load-tests:
     name: blazemeter/taurus:latest
     entrypoint: [""]
   tags:
-    - gitlab-org
+    - docker
   stage: taurus-load-tests
   script:
     - bzt load-tests.yml
@@ -138,7 +138,7 @@ owasp-zap-scan:
       alias: webapi
   image: owasp/zap2docker-stable:latest
   tags:
-    - gitlab-org
+    - docker
   stage: dast-scan
   script:
     - mkdir /zap/wrk/
@@ -155,7 +155,7 @@ nikto-scan:
   image:
     name: perl:latest
   tags:
-    - gitlab-org
+    - docker
   stage: dast-scan
   script:
     - git clone https://github.com/sullo/nikto
@@ -177,7 +177,7 @@ send-mail-reports:
     REPORT_FILES: gl-sast-report.json,taurus-load-tests-report.csv,owasp-zap-scan-report.html,nikto-scan-report.html,dependency-check-report.html,gl-container-scanning-report.json,trivy-container-scan-report.html
   image: python:3.8-alpine
   tags:
-    - gitlab-org
+    - docker
   stage: send-mail
   script:
     - |
