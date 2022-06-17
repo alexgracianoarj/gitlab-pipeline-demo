@@ -15,10 +15,11 @@ stages:
   - container-scan
   - taurus-load-tests
   - dast-scan
-  - send-mail
+  - send-scans
 
 include:
   - template: Security/SAST.gitlab-ci.yml
+  - template: Security/Secret-Detection.gitlab-ci.yml
 
 build:
   stage: build
@@ -41,6 +42,15 @@ unit-tests:
   script:
     - mvn test
 
+secret_detection:
+  before_script:
+    - git config --global http.sslVerify false
+  stage: sast-scan
+  allow_failure: true
+  artifacts:
+    paths:
+      - gl-secret-detection-report.json
+
 spotbugs-sast:
   dependencies:
     - build
@@ -52,10 +62,11 @@ spotbugs-sast:
     - gitlab-org
   script:
     - /analyzer run
+    - cp /tmp/SpotBugs.xml .
   allow_failure: true
   artifacts:
     paths:
-      - gl-sast-report.json
+      - SpotBugs.xml
 
 owasp-dependency-check:
   image:
@@ -65,21 +76,23 @@ owasp-dependency-check:
   tags:
     - gitlab-org
   script:
-    - /usr/share/dependency-check/bin/dependency-check.sh --scan "./" --format "HTML" --project "$CI_PROJECT_NAME" --suppression "./owasp-depscan-suppress.xml" --out "./dependency-check-report.html" || true
+    - /usr/share/dependency-check/bin/dependency-check.sh --scan "./" --format "XML" --project "$CI_PROJECT_NAME" --suppression "./owasp-depscan-suppress.xml" --out "./dependency-check-report.xml" || true
   allow_failure: true
   artifacts:
     paths:
-      - dependency-check-report.html
+      - dependency-check-report.xml
 
 build-docker-image:
+  dependencies:
+    - build
   variables:
     DOCKER_HOST: tcp://docker:2376
     DOCKER_TLS_CERTDIR: /certs
     DOCKER_TLS_VERIFY: 1
     DOCKER_CERT_PATH: $DOCKER_TLS_CERTDIR/client
   services:
-    - name: docker:19.03.12-dind
-  image: docker:19.03.12
+    - name: docker:20.10.17-dind
+  image: docker:20.10.17
   tags:
     - gitlab-org-docker
   stage: build-docker-image
@@ -89,7 +102,7 @@ build-docker-image:
     - docker push $CI_REGISTRY_IMAGE:latest
 
 trivy-container-scan:
-  image: docker:19.03.12
+  image: docker:20.10.17
   tags:
     - gitlab-org-docker
   stage: container-scan
@@ -101,20 +114,20 @@ trivy-container-scan:
     IMAGE: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
     TRIVY_DEBUG: "true"
   services:
-    - name: docker:19.03.12-dind
+    - name: docker:20.10.17-dind
   before_script:
     - export TRIVY_VERSION=$(wget -qO - "https://api.github.com/repos/aquasecurity/trivy/releases/latest" | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
     - wget --no-verbose https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz -O - | tar -zxvf -
   allow_failure: true
   script:
     - docker build -t $IMAGE .
-    - ./trivy image --severity HIGH,CRITICAL --format template --template "@contrib/html.tpl" --output trivy-container-scan-report.html $IMAGE
+    - ./trivy image --format json --output trivy-container-scan-report.json $IMAGE
   cache:
     paths:
       - .trivycache/
   artifacts:
     paths:
-      - trivy-container-scan-report.html
+      - trivy-container-scan-report.json
 
 taurus-load-tests:
   services:
@@ -142,11 +155,11 @@ owasp-zap-scan:
   stage: dast-scan
   script:
     - mkdir /zap/wrk/
-    - /zap/zap-api-scan.py -t http://webapi:8000/v3/api-docs -f openapi -r owasp-zap-scan-report.html || true
-    - cp /zap/wrk/owasp-zap-scan-report.html .
+    - /zap/zap-api-scan.py -t http://webapi:8000/v3/api-docs -f openapi -x owasp-zap-scan-report.xml || true
+    - cp /zap/wrk/owasp-zap-scan-report.xml .
   artifacts:
     paths:
-      - owasp-zap-scan-report.html
+      - owasp-zap-scan-report.xml
 
 nikto-scan:
   services:
@@ -159,62 +172,188 @@ nikto-scan:
   stage: dast-scan
   script:
     - git clone https://github.com/sullo/nikto
-    - perl ./nikto/program/nikto.pl -h http://webapi:8000 -o /tmp/nikto-scan-report.html || true
-    - cp /tmp/nikto-scan-report.html .
+    - perl ./nikto/program/nikto.pl -h http://webapi:8000 -o /tmp/nikto-scan-report.xml || true
+    - cp /tmp/nikto-scan-report.xml .
   artifacts:
     paths:
-      - nikto-scan-report.html
+      - nikto-scan-report.xml
 
-send-mail-reports:
+send-scans:
   dependencies:
+    - secret_detection
     - spotbugs-sast
-    - taurus-load-tests
     - owasp-zap-scan
     - nikto-scan
     - trivy-container-scan
     - owasp-dependency-check
-  variables:
-    REPORT_FILES: gl-sast-report.json,taurus-load-tests-report.csv,owasp-zap-scan-report.html,nikto-scan-report.html,dependency-check-report.html,gl-container-scanning-report.json,trivy-container-scan-report.html
   image: python:3.8-alpine
   tags:
     - gitlab-org
-  stage: send-mail
+  stage: send-scans
   script:
+    - pip install requests
     - |
-      cat << EOF > send_mail.py
+      cat << EOF > send_scans.py
       import os
-      import smtplib
-      import email.utils
-      from email.mime.multipart import MIMEMultipart
-      from email.mime.application import MIMEApplication
-      from email.mime.text import MIMEText
+      import json
+      from datetime import datetime, timedelta
+      from typing import Dict, List
+      import requests
 
-      msg = MIMEMultipart("alternative")
-      msg["Subject"] = f"Send Mail Reports - Project '{os.getenv('CI_PROJECT_TITLE')}'"
-      msg["From"] = email.utils.formataddr(("Send Mail Reports", os.getenv("SENDER")))
-      msg["To"] = os.getenv("RECIPIENT")
-      msg.attach(MIMEText("Send Mail Reports"))
-      for filename in os.getenv("REPORT_FILES").split(","):
-        try:
-          with open(filename, "rb") as file:
-              part = MIMEApplication(file.read(), Name=filename)
-          part["Content-Disposition"] = f"attachment; filename={filename}"
-          msg.attach(part)
-        except Exception as error:
-            print("Error on try read file: ", error)
-      try:
-          server = smtplib.SMTP(os.getenv("SMTP_HOST"), os.getenv("SMTP_PORT"))
-          server.ehlo()
-          server.starttls()
-          server.ehlo()
-          server.login(os.getenv("SMTP_USER"), os.getenv("SMTP_PASSWORD"))
-          for recipient in os.getenv("RECIPIENT").split(","):
-            server.sendmail(os.getenv("SENDER"), recipient, msg.as_string())
-          server.close()
-      except Exception as error:
-          print("Error on try send email: ", error)
-          exit(1)
-      else:
-          print("Email sent!")
+      class SendScans:
+          def __init__(self, defectdojo_host: str, defectdojo_user: str, defectdojo_password: str):
+              self.defectdojo_host = defectdojo_host
+              self.defectdojo_user = defectdojo_user
+              self.defectdojo_password = defectdojo_password
+              self.defectdojo_api_key = self.__get_defectdojo_api_key()
+              self.product_id = None
+              self.engagement_id = None
+              self.start_date = None
+              self.end_date = None
+
+          def __get_defectdojo_api_key(self) -> str:
+              try:
+                  url = f"{self.defectdojo_host}/api/v2/api-token-auth/"
+                  payload = json.dumps({"username": self.defectdojo_user, "password": self.defectdojo_password})
+                  headers = {"Accept": "application/json", "Content-Type": "application/json"}
+                  response = requests.request("POST", url, headers=headers, data=payload)
+                  response.raise_for_status()
+                  return response.json()["token"]
+              except requests.exceptions.HTTPError as e:
+                  print(f"Failed to get API key: {e}")
+                  raise e
+
+          def __product_exists(self, product_name: str) -> int:
+              url = f"{self.defectdojo_host}/api/v2/products/?name={product_name}"
+              headers = {"Accept": "application/json", "Authorization": f"Token {self.defectdojo_api_key}"}
+              try:
+                  response = requests.request("GET", url, headers=headers)
+                  response.raise_for_status()
+                  if len(response.json()["results"]) == 0:
+                      return None
+                  return response.json()["results"][0]["id"]
+              except requests.exceptions.RequestException as e:
+                  print(f"Failed to get product: {e}")
+                  raise e
+
+          def create_product(self, product_name: str, product_description: str, product_type: int) -> None:
+              self.product_id = self.__product_exists(product_name)
+              if self.product_id is None:
+                  url = f"{self.defectdojo_host}/api/v2/products/"
+                  payload = json.dumps({"name": product_name, "description": product_description, "prod_type": product_type})
+                  headers = {"Accept": "application/json", "Authorization": f"Token {self.defectdojo_api_key}", "Content-Type": "application/json"}
+                  try:
+                      response = requests.request("POST", url, headers=headers, data=payload)
+                      response.raise_for_status()
+                      self.product_id = response.json()["id"]
+                      print(f"Created product {self.product_id}")
+                  except requests.exceptions.HTTPError as e:
+                      print(f"Failed to create product: {e}")
+                      raise e
+
+          def create_engagement(
+              self,
+              pipeline_id: str,
+              commit_hash: str,
+              branch_or_tag: str,
+              version: str,
+              repo_uri: str,
+              scm_server: int,
+              build_server: int,
+              engagement_duration_days: int,
+          ) -> None:
+              url = f"{self.defectdojo_host}/api/v2/engagements/"
+              self.start_date = datetime.now().strftime("%Y-%m-%d")
+              self.end_date = (datetime.now() + timedelta(days=engagement_duration_days)).strftime("%Y-%m-%d")
+              payload = json.dumps(
+                  {
+                      "product": self.product_id,
+                      "name": f"Gitlab CI #{pipeline_id}",
+                      "version": version,
+                      "target_start": self.start_date,
+                      "target_end": self.end_date,
+                      "status": "In Progress",
+                      "engagement_type": "CI/CD",
+                      "active": True,
+                      "build_id": f"#{pipeline_id}",
+                      "commit_hash": commit_hash,
+                      "branch_tag": branch_or_tag,
+                      "source_code_management_uri": repo_uri,
+                      "source_code_management_server": scm_server,
+                      "build_server": build_server,
+                      "deduplication_on_engagement": False,
+                  }
+              )
+              headers = {"Accept": "application/json", "Authorization": f"Token {self.defectdojo_api_key}", "Content-Type": "application/json"}
+              try:
+                  response = requests.request("POST", url, headers=headers, data=payload)
+                  response.raise_for_status()
+                  self.engagement_id = response.json()["id"]
+                  print(f"Created engagement {self.engagement_id}")
+              except requests.exceptions.HTTPError as e:
+                  print(f"Failed to create engagement: {e}")
+                  raise e
+
+          def upload_scans(self, scans: List[Dict[str, str]]) -> None:
+              for scan in scans:
+                  url = f"{self.defectdojo_host}/api/v2/import-scan/"
+                  payload = {
+                      "scan_date": self.start_date,
+                      "engagement": self.engagement_id,
+                      "scan_type": scan["scan_type"],
+                      "active": "true",
+                      "verified": "false",
+                      #"close_old_findings": "true",
+                      "skip_duplicates": "true",
+                      "minimum_severity": "Info",
+                  }
+                  try:
+                      file = {"file": open(scan["scan_file"], "rb")}
+                  except Exception as e:
+                      print(f"Failed to open scan file {scan['scan_file']}: {e}")
+                      continue
+                  headers = {"Accept": "application/json", "Authorization": f"Token {self.defectdojo_api_key}"}
+                  try:
+                      response = requests.request("POST", url, headers=headers, data=payload, files=file)
+                      response.raise_for_status()
+                      print(f"Uploaded scan {scan['scan_file']}")
+                  except requests.exceptions.HTTPError as e:
+                      print(f"Failed to upload scan {scan['scan_file']}: {e}")
+                      continue
+
+      def main():
+          DEFECTDOJO_HOST = os.getenv("DEFECTDOJO_HOST")
+          DEFECTDOJO_USER = os.getenv("DEFECTDOJO_USER")
+          DEFECTDOJO_PASSWORD = os.getenv("DEFECTDOJO_PASSWORD")
+          send_scans = SendScans(DEFECTDOJO_HOST, DEFECTDOJO_USER, DEFECTDOJO_PASSWORD)
+          PRODUCT = os.getenv("CI_PROJECT_TITLE")
+          send_scans.create_product(PRODUCT, PRODUCT, 1)  # 1 - Research and Development, product type
+          PIPELINE_ID = os.getenv("CI_PIPELINE_ID")
+          VERSION = os.getenv("VERSION")
+          if VERSION is None:
+            VERSION = os.getenv("CI_COMMIT_SHORT_SHA")
+          COMMIT_HASH = os.getenv("CI_COMMIT_SHA")
+          BRANCH_OR_TAG = os.getenv("CI_COMMIT_REF_NAME")
+          REPO_URI = os.getenv("CI_PROJECT_URL")
+          SCM_SERVER = 1
+          BUILD_SERVER = 2
+          ENGAGEMENT_DURATION_DAYS = 100  # Medium Finding SLA Days + 10
+          send_scans.create_engagement(PIPELINE_ID, COMMIT_HASH, BRANCH_OR_TAG, VERSION, REPO_URI, SCM_SERVER, BUILD_SERVER, ENGAGEMENT_DURATION_DAYS)
+          scans = [
+              {"scan_type": "Nikto Scan", "scan_file": "nikto-scan-report.xml"},
+              {"scan_type": "SpotBugs Scan", "scan_file": "SpotBugs.xml"},
+              {"scan_type": "ZAP Scan", "scan_file": "owasp-zap-scan-report.xml"},
+              {"scan_type": "Trivy Scan", "scan_file": "trivy-container-scan-report.json"},
+              {"scan_type": "Dependency Check Scan", "scan_file": "dependency-check-report.xml"},
+              {"scan_type": "GitLab Secret Detection Report", "scan_file": "gl-secret-detection-report.json"},
+              {"scan_type": "Test", "scan_file": "test.xml"},
+          ]
+          send_scans.upload_scans(scans)
+
+      if __name__ == "__main__":
+          main()
       EOF
-    - python send_mail.py
+    - python send_scans.py
+  only:
+    - develop
+    - release
