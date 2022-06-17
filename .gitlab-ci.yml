@@ -354,6 +354,3 @@ send-scans:
           main()
       EOF
     - python send_scans.py
-  only:
-    - develop
-    - release
