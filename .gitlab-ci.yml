@@ -107,8 +107,8 @@ build-docker-image:
     - docker push $CI_REGISTRY_IMAGE:latest
 
 trivy-container-scan:
-  needs: []
-  interruptible: false
+  dependencies:
+    - build
   image: docker:20.10.17
   tags:
     - gitlab-org-docker
