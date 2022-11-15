@@ -44,6 +44,7 @@ unit-tests:
 
 secret_detection:
   needs: []
+  interruptible: false
   before_script:
     - git config --global http.sslVerify false
   stage: sast-scan
@@ -53,6 +54,7 @@ secret_detection:
       - gl-secret-detection-report.json
 
 spotbugs-sast:
+  interruptible: false
   dependencies:
     - build
   variables:
@@ -71,6 +73,7 @@ spotbugs-sast:
 
 owasp-dependency-check:
   needs: []
+  interruptible: false
   image:
     name: owasp/dependency-check:latest
     entrypoint: [""]
@@ -105,6 +108,7 @@ build-docker-image:
 
 trivy-container-scan:
   needs: []
+  interruptible: false
   image: docker:20.10.17
   tags:
     - gitlab-org-docker
@@ -151,6 +155,7 @@ taurus-load-tests:
 
 owasp-zap-scan:
   needs: []
+  interruptible: false
   services:
     - name: $CI_REGISTRY_IMAGE:latest
       alias: webapi
@@ -168,6 +173,7 @@ owasp-zap-scan:
 
 nikto-scan:
   needs: []
+  interruptible: false
   services:
     - name: $CI_REGISTRY_IMAGE:latest
       alias: webapi
