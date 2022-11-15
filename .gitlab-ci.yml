@@ -104,6 +104,7 @@ build-docker-image:
     - docker push $CI_REGISTRY_IMAGE:latest
 
 trivy-container-scan:
+  needs: []
   image: docker:20.10.17
   tags:
     - gitlab-org-docker
@@ -132,6 +133,7 @@ trivy-container-scan:
       - trivy-container-scan-report.json
 
 taurus-load-tests:
+  needs: []
   services:
     - name: $CI_REGISTRY_IMAGE:latest
       alias: webapi
@@ -148,6 +150,7 @@ taurus-load-tests:
       - taurus-load-tests-report.csv
 
 owasp-zap-scan:
+  needs: []
   services:
     - name: $CI_REGISTRY_IMAGE:latest
       alias: webapi
@@ -164,6 +167,7 @@ owasp-zap-scan:
       - owasp-zap-scan-report.xml
 
 nikto-scan:
+  needs: []
   services:
     - name: $CI_REGISTRY_IMAGE:latest
       alias: webapi
