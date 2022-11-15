@@ -43,6 +43,7 @@ unit-tests:
     - mvn test
 
 secret_detection:
+  needs: []
   before_script:
     - git config --global http.sslVerify false
   stage: sast-scan
@@ -69,6 +70,7 @@ spotbugs-sast:
       - SpotBugs.xml
 
 owasp-dependency-check:
+  needs: []
   image:
     name: owasp/dependency-check:latest
     entrypoint: [""]
